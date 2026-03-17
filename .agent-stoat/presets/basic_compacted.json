@@ -1,0 +1,11 @@
+{
+  "name": "Generalist w/ Compaction",
+  "description": "General-purpose assistant with tools — auto-compacts when context fills past threshold",
+  "prompt_file": "prompt_basic.md",
+  "max_iterations": 50,
+  "compaction": {
+    "enabled": true,
+    "threshold": 80,
+    "keep_recent": 16
+  }
+}

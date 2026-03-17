@@ -1,0 +1,9 @@
+{
+  "name": "Coder",
+  "description": "Coding-focused assistant with tools",
+  "prompt_file": "prompt_coder.md",
+  "max_iterations": 50,
+  "compaction": {
+    "enabled": false
+  }
+}

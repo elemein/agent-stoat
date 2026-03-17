@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# CUDA backend — too large for git (see README for download instructions)
+llama_cpp_backends/cuda/*
+!llama_cpp_backends/cuda/.gitkeep
+
+# Agent runtime state — ignore specific runtime files, keep presets/ tracked
+.agent-stoat/history
+.agent-stoat/settings.json
+.agent-stoat/*.log
+.agent-stoat/*.md
+.agent-stoat/blackboard.json
+
+# Working directory sessions (user-generated, not tracked)
+agent-stoat_working-dir/*
+!agent-stoat_working-dir/.gitkeep
+
+# Models are user-provided (too large for git)
+models/*
+!models/.gitkeep
+*.part
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

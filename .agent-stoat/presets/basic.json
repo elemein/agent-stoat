@@ -1,0 +1,9 @@
+{
+  "name": "Generalist",
+  "description": "General-purpose assistant with tools",
+  "prompt_file": "prompt_basic.md",
+  "max_iterations": 50,
+  "compaction": {
+    "enabled": false
+  }
+}
