@@ -31,11 +31,13 @@ SERVER_HOST = f"http://localhost:{SERVER_PORT}"
 def detect_gpu() -> str:
     """Detect available GPU backend. Returns 'cuda', 'vulkan', or 'cpu'."""
 
+    _win_flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}
+
     # Check NVIDIA first
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, **_win_flags
         )
         if result.returncode == 0 and result.stdout.strip():
             gpu_name = result.stdout.strip().splitlines()[0]
@@ -48,7 +50,7 @@ def detect_gpu() -> str:
     try:
         result = subprocess.run(
             ["vulkaninfo", "--summary"] if not IS_WINDOWS else ["vulkaninfo.exe", "--summary"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, **_win_flags
         )
         if result.returncode == 0:
             print("  \033[32m✓\033[0m Detected Vulkan-capable GPU")
@@ -63,9 +65,10 @@ def detect_gpu() -> str:
 def get_vram_info() -> dict:
     """Query nvidia-smi for GPU VRAM. Returns {} if unavailable."""
     try:
+        _win_flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, **_win_flags
         )
         if result.returncode != 0:
             return {}
@@ -372,9 +375,10 @@ def start_server(
             "cwd": os.path.dirname(binary_path),  # DLLs live next to the binary
             "env": env,
         }
-        # On Windows, create a new process group so we can kill it cleanly
+        # On Windows, create a new process group so we can kill it cleanly,
+        # and suppress the console window that would otherwise flash up.
         if IS_WINDOWS:
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
         _server_process = subprocess.Popen(cmd, **kwargs)
 

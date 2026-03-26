@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import threading
 
 # Add scripts directory to path so supporting modules can be imported
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-stoat_scripts"))
@@ -18,7 +19,8 @@ from config import BASIC_PROMPT, MODEL_REPO, MODEL_FILE, _load_prompt
 from llm_client import (
     chat_stream, get_token_usage,
     get_settings, reset_token_usage, get_model_info,
-    get_vram_info, estimate_recommended_ctx, get_loaded_models
+    get_vram_info, estimate_recommended_ctx, get_loaded_models,
+    load_image_b64,
 )
 from llm_server import (
     setup_environment, load_model, stop_server, is_server_running,
@@ -31,6 +33,11 @@ from tools import (
     AGENT_DATA_DIR, WORKING_DIR
 )
 from chat_engine import ChatEngine
+from integrations import (
+    is_installed, get_package_version, install_package,
+    get_discord_settings, save_discord_settings,
+)
+import discord_bridge
 
 
 # ANSI colors
@@ -49,6 +56,21 @@ BOLD = "\033[1m"
 
 def print_colored(text: str, color: str = RESET) -> None:
     print(f"{color}{text}{RESET}")
+
+
+_IMAGE_RE = re.compile(
+    r'\[([^\]]+\.(?:png|jpg|jpeg|gif|webp|bmp))\]', re.IGNORECASE
+)
+
+
+def _extract_images(text: str) -> tuple[str, list[str]]:
+    """Parse [image.png] references out of a user message.
+
+    Returns (cleaned_text_without_brackets, list_of_paths).
+    """
+    paths = _IMAGE_RE.findall(text)
+    cleaned = _IMAGE_RE.sub("", text).strip()
+    return cleaned, paths
 
 
 def _shorten_model_name(name: str, max_len: int = 20) -> str:
@@ -90,8 +112,21 @@ def load_preset(name: str) -> dict:
 # Chat engine dispatch
 # ---------------------------------------------------------------------------
 
-# Persists across turns within a session
+# CLI conversation history — persists across turns within a session
 _conv_history: list[dict] = []
+
+# Per-guild Discord histories — keyed by guild_id (str) or "dm_<user_id>"
+_discord_histories: dict[str, list[dict]] = {}
+
+# Prevents simultaneous CLI and Discord turns hitting the LLM at once
+_turn_lock = threading.Lock()
+
+
+def _get_discord_history(guild_key: str) -> list[dict]:
+    """Return (and lazily create) the conversation history for a Discord context."""
+    if guild_key not in _discord_histories:
+        _discord_histories[guild_key] = []
+    return _discord_histories[guild_key]
 
 
 def reset_conv_history() -> None:
@@ -104,8 +139,12 @@ def _get_usage_pct() -> float:
     return get_token_usage().percentage
 
 
-def run_chat(goal: str) -> None:
-    """Run the current preset's chat engine with the given goal."""
+def run_chat(goal: str, output_callback=None, ask_permission=None, conv_history=None) -> None:
+    """Run the current preset's chat engine with the given goal.
+
+    conv_history: if provided, uses this list instead of the global _conv_history.
+    Used to give each Discord guild its own isolated context.
+    """
     settings = get_settings()
 
     try:
@@ -136,8 +175,9 @@ def run_chat(goal: str) -> None:
         tool_executor=execute_tool,
         is_dangerous=is_dangerous,
         get_permission=get_permission,
-        conv_history=_conv_history,
+        conv_history=conv_history if conv_history is not None else _conv_history,
         get_usage_pct=_get_usage_pct,
+        ask_permission=ask_permission,
     )
 
     engine.run(
@@ -148,13 +188,109 @@ def run_chat(goal: str) -> None:
         compaction=compaction_enabled,
         compact_threshold=compact_threshold,
         keep_recent=keep_recent,
+        output_callback=output_callback,
     )
 
 
-def conversational_turn(user_input: str) -> None:
-    """Append user message to history and run the chat engine."""
-    _conv_history.append({"role": "user", "content": user_input})
-    run_chat(user_input)
+def conversational_turn(user_input: str, discord_msg=None, conv_history=None) -> None:
+    """Append user message to history and run the chat engine.
+
+    If discord_msg is a DiscordMessage, the response is also collected and
+    sent back to Discord via discord_msg.reply(). The turn is echoed to the
+    terminal with a [Discord: author] prefix regardless.
+
+    If conv_history is provided it is used instead of the global _conv_history
+    (used to give each Discord guild its own isolated context).
+
+    If the message contains [image.png] references, loads and base64-encodes
+    them and sends a multimodal content array to the model.
+    """
+    history = conv_history if conv_history is not None else _conv_history
+    text, image_paths = _extract_images(user_input)
+
+    if image_paths:
+        if get_backend() == "vulkan":
+            print_colored("  Note: vision on Vulkan may be unstable — consider CUDA if output looks wrong.", YELLOW)
+
+        content = [{"type": "text", "text": text or user_input}]
+        for path in image_paths:
+            full_path = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+            if not os.path.isfile(full_path):
+                print_colored(f"  Image not found: {path}", RED)
+                return
+            try:
+                mime, b64 = load_image_b64(full_path)
+                content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                size_kb = os.path.getsize(full_path) // 1024
+                print_colored(f"  Image: {os.path.basename(path)} ({size_kb} KB)", DIM)
+            except Exception as e:
+                print_colored(f"  Failed to load {path}: {e}", RED)
+                return
+
+        history.append({"role": "user", "content": content})
+    else:
+        history.append({"role": "user", "content": user_input})
+
+    # Build output callback for Discord: collect streamed tokens, send on completion
+    output_callback = None
+    if discord_msg is not None:
+        _response_buf: list[str] = []
+
+        def _collect(chunk: str):
+            _response_buf.append(chunk)
+
+        output_callback = _collect
+
+        def _ask_discord(tool_name: str, args: dict) -> bool:
+            return discord_bridge.request_permission(
+                channel_id=discord_msg.channel_id,
+                user_id=discord_msg.user_id,
+                user_mention=discord_msg.user_mention,
+                tool_name=tool_name,
+                args=args,
+            )
+
+        def _send_discord_reply(error: str = None):
+            if error:
+                discord_msg.reply(f"_(error: {error})_")
+                return
+            full = "".join(_response_buf).strip()
+            if full:
+                discord_msg.reply(full)
+
+        try:
+            run_chat(user_input, output_callback=output_callback, ask_permission=_ask_discord, conv_history=conv_history)
+        except Exception as e:
+            _send_discord_reply(error=str(e))
+            raise
+        _send_discord_reply()
+        return
+
+    run_chat(user_input, conv_history=conv_history)
+
+
+def _process_discord_message(discord_msg) -> None:
+    """Called by the Discord worker thread for each incoming Discord message.
+
+    Acquires the turn lock so CLI and Discord turns never overlap, prints the
+    message to the terminal, then runs a full conversational turn.
+    """
+    with _turn_lock:
+        # Determine which per-guild history to use
+        guild_key = str(discord_msg.guild_id) if discord_msg.guild_id else f"dm_{discord_msg.user_id}"
+        guild_history = _get_discord_history(guild_key)
+
+        # Prefix message with server label so the model knows which server it's in
+        labeled_content = f"[Server: {discord_msg.guild_name}] {discord_msg.content}"
+
+        # Print clearly to terminal so the operator sees who asked what
+        print(f"\n{CYAN}{BOLD}[Discord: {discord_msg.author} @ {discord_msg.guild_name}]{RESET} {discord_msg.content}")
+        discord_bridge.clear_interrupt()
+        try:
+            conversational_turn(labeled_content, discord_msg=discord_msg, conv_history=guild_history)
+        except Exception as e:
+            print(f"\n{RED}  [Discord] Turn error: {e}{RESET}")
+        draw_status_bar()
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +318,7 @@ def draw_status_bar() -> None:
     width = _get_terminal_width()
     height = _get_terminal_height()
 
-    pct = usage.percentage
+    pct = min(usage.percentage, 100.0)
     bar_width = 12
     filled = int(bar_width * pct / 100)
     bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
@@ -233,6 +369,9 @@ def handle_command(cmd: str) -> bool | None:
     if command in ('/help', '/h', '/?'):
         print_colored("\n  Available commands:", BOLD)
         print_colored("    /help, /h        Show this help", DIM)
+        print_colored("\n  Images:", BOLD)
+        print_colored("    Embed [image.png] anywhere in your message to include an image.", DIM)
+        print_colored("    Example:  what's in this screenshot? [screenshot.png]", DIM)
         print_colored("    /ctx <size>      Set context window (e.g., /ctx 16384)", DIM)
         print_colored("    /temp <value>    Set temperature (e.g., /temp 0.5)", DIM)
         print_colored("    /model <name>    Load a model from models/ (restarts server)", DIM)
@@ -244,6 +383,7 @@ def handle_command(cmd: str) -> bool | None:
         print_colored("    /backend <name>  Switch GPU backend (cuda, vulkan, cpu)", DIM)
         print_colored("    /compact [n]     Compact history (keep last n messages, default 6)", DIM)
         print_colored("    /clear           Clear conversation history", DIM)
+        print_colored("    /discord <start|stop|status>  Control Discord bot", DIM)
         print_colored("    /exit, exit      Quit", DIM)
         print_colored("\n  Esc                Interrupt current generation", DIM)
         return True
@@ -342,7 +482,7 @@ def handle_command(cmd: str) -> bool | None:
         keep_recent = 6
         if arg:
             try:
-                keep_recent = int(arg)
+                keep_recent = max(1, int(arg))
             except ValueError:
                 pass
 
@@ -354,15 +494,28 @@ def handle_command(cmd: str) -> bool | None:
         old_msgs = _conv_history[:cutoff]
         recent_msgs = _conv_history[cutoff:]
 
+        def _msg_text(msg: dict) -> str:
+            """Extract plain text from a message, handling array content (multimodal)."""
+            c = msg.get("content") or ""
+            if isinstance(c, list):
+                parts = [p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text"]
+                return " ".join(parts)
+            return c
+
         summary_parts = []
         files_mentioned = set()
         actions = []
         for msg in old_msgs:
             role = msg.get("role", "")
-            content = msg.get("content") or ""
+            content = _msg_text(msg)
 
             if role == "user":
+                has_images = isinstance(msg.get("content"), list) and any(
+                    p.get("type") == "image_url" for p in msg["content"] if isinstance(p, dict)
+                )
                 short = content[:150].replace("\n", " ").strip()
+                if has_images:
+                    short += " [image]"
                 summary_parts.append(f"- User: {short}")
             elif role == "assistant":
                 if "tool_calls" in msg and msg["tool_calls"]:
@@ -405,7 +558,12 @@ def handle_command(cmd: str) -> bool | None:
         if files_mentioned:
             summary += f"\nFiles touched: {', '.join(sorted(files_mentioned))}\n"
 
-        new_history = [{"role": "assistant", "content": summary}] + recent_msgs
+        # Wrap summary in a user/assistant exchange so history starts with a
+        # user message — models expect this and will ignore a bare assistant message.
+        new_history = [
+            {"role": "user", "content": "[Earlier conversation compacted. Summary below.]"},
+            {"role": "assistant", "content": summary},
+        ] + recent_msgs
         _conv_history.clear()
         _conv_history.extend(new_history)
 
@@ -515,6 +673,33 @@ def handle_command(cmd: str) -> bool | None:
             print_colored(f"  Place the {arg} build in: llama_cpp_backends/{arg}/", DIM)
         return True
 
+    elif command == '/discord':
+        sub = (arg or "").strip().lower()
+        if sub == "start":
+            if discord_bridge.is_running():
+                print_colored("  Discord bot is already running.", CYAN)
+            else:
+                cfg = get_discord_settings()
+                if discord_bridge.start(cfg):
+                    print_colored("  Discord bot started.", GREEN)
+                else:
+                    print_colored("  Failed to start Discord bot. Check token and install status.", RED)
+        elif sub == "stop":
+            if discord_bridge.is_running():
+                discord_bridge.stop()
+                print_colored("  Discord bot stopped.", YELLOW)
+            else:
+                print_colored("  Discord bot is not running.", DIM)
+        elif sub == "status":
+            running = discord_bridge.is_running()
+            cfg = get_discord_settings()
+            print_colored(f"\n  Discord bot:   {'running' if running else 'stopped'}", GREEN if running else DIM)
+            print_colored(f"  Token:         {'set' if cfg['token'] else 'NOT SET'}", CYAN)
+            print_colored(f"  Trigger:       {cfg['trigger']}", CYAN)
+        else:
+            print_colored("  Usage: /discord <start|stop|status>", DIM)
+        return True
+
     elif command in ('/exit', '/quit'):
         return None
 
@@ -531,7 +716,7 @@ def startup_menu() -> None:
 
     if not is_server_running():
         if not _load_model_interactive(MODEL_FILE):
-            print_colored("  No model loaded. Use [2] to load one.", YELLOW)
+            print_colored("  No model loaded. Use [3] to load one.", YELLOW)
 
     while True:
         server_up = is_server_running()
@@ -540,13 +725,20 @@ def startup_menu() -> None:
         preset_label = settings.preset
         backend_label = get_backend().upper()
 
+        discord_installed = is_installed("discord")
+        discord_cfg = get_discord_settings()
+        discord_ready = discord_installed and bool(discord_cfg.get("token"))
+        discord_tag = (GREEN + "ready" + RESET) if discord_ready else (DIM + "not configured" + RESET)
+
         rows = [
             ("[1] Start", None, ""),
-            ("[2] Load Model       ", model_tag, model_color),
-            ("[3] Set Context Window", None, ""),
-            ("[4] Set Permissions", None, ""),
-            ("[5] Switch Preset    ", preset_label, ""),
-            ("[6] Switch Backend   ", backend_label, ""),
+            ("[2] Start  (Persistent + Discord)", None, ""),
+            ("[3] Load Model       ", model_tag, model_color),
+            ("[4] Set Context Window", None, ""),
+            ("[5] Set Permissions", None, ""),
+            ("[6] Switch Preset    ", preset_label, ""),
+            ("[7] Switch Backend   ", backend_label, ""),
+            ("[8] Integrations", None, ""),
         ]
 
         def _visible_len(text, tag):
@@ -571,18 +763,36 @@ def startup_menu() -> None:
             print(menu_line(text, tag, color))
         print(f"  {BOLD}╰{'─' * W}╯{RESET}")
 
-        choice = input("  Select [1-6]: ").strip()
+        choice = input("  Select [1-8]: ").strip()
 
         if choice in ('', '1'):
             if not server_up:
-                print_colored("  No model loaded! Use [2] to load one first.", YELLOW)
+                print_colored("  No model loaded! Use [3] to load one first.", YELLOW)
                 continue
             return
 
         elif choice == '2':
-            _load_model_interactive()
+            if not server_up:
+                print_colored("  No model loaded! Use [3] to load one first.", YELLOW)
+                continue
+            if not discord_installed:
+                print_colored("  discord.py not installed. Go to [8] Integrations to install it.", YELLOW)
+                continue
+            if not discord_cfg.get("token"):
+                print_colored("  No bot token set. Go to [8] Integrations → Discord to configure it.", YELLOW)
+                continue
+            if discord_bridge.start(discord_cfg):
+                discord_bridge.start_worker(_process_discord_message)
+                print_colored("  Discord bot started. Running in Persistent + Discord mode.", GREEN)
+            else:
+                print_colored("  Failed to start Discord bot. Check your token in Integrations.", RED)
+                continue
+            return
 
         elif choice == '3':
+            _load_model_interactive()
+
+        elif choice == '4':
             info = get_model_info()
             max_ctx = info.get("context_length")
             param_count = info.get("parameter_count")
@@ -646,7 +856,7 @@ def startup_menu() -> None:
                 except ValueError:
                     print_colored("  Invalid number", RED)
 
-        elif choice == '4':
+        elif choice == '5':
             perm_cycle = [None, True, False]
             tool_list = sorted(ALL_TOOL_NAMES)
 
@@ -681,7 +891,7 @@ def startup_menu() -> None:
                 except ValueError:
                     print_colored("  Invalid selection", RED)
 
-        elif choice == '5':
+        elif choice == '6':
             presets = list_presets()
             if not presets:
                 print_colored("  No presets found", RED)
@@ -702,7 +912,7 @@ def startup_menu() -> None:
                 except ValueError:
                     print_colored("  Invalid selection", RED)
 
-        elif choice == '6':
+        elif choice == '7':
             backends = ["cuda", "vulkan", "cpu"]
             current = get_backend()
             print_colored("\n  Available backends:", BOLD)
@@ -730,6 +940,77 @@ def startup_menu() -> None:
                         print_colored("  Invalid selection", RED)
                 except ValueError:
                     print_colored("  Invalid selection", RED)
+
+        elif choice == '8':
+            _integrations_menu()
+
+        else:
+            print_colored("  Invalid selection", RED)
+
+
+# ---------------------------------------------------------------------------
+# Integrations menu
+# ---------------------------------------------------------------------------
+
+def _integrations_menu() -> None:
+    """Integrations menu — unified Discord install + configuration."""
+    while True:
+        discord_installed = is_installed("discord")
+        discord_version = get_package_version("discord") or "not installed"
+        cfg = get_discord_settings() if discord_installed else {}
+        token_display = (cfg.get("token", "")[:8] + "...") if len(cfg.get("token", "")) > 8 else (cfg.get("token") or f"{RED}NOT SET{RESET}")
+
+        print_colored("\n  Integrations — Discord:", BOLD)
+        print_colored(f"  discord.py: {GREEN + discord_version + RESET if discord_installed else RED + 'NOT INSTALLED' + RESET}", "")
+        if discord_installed:
+            print_colored(f"  Token:      {token_display}", "")
+            print_colored(f"  Trigger:    {DIM}{cfg.get('trigger', 'mention')}{RESET}", "")
+            print()
+            print_colored(f"    [1] Bot Token", "")
+            print_colored(f"    [2] Trigger mode", "")
+            if cfg.get("trigger") == "prefix":
+                print_colored(f"    [3] Prefix            {DIM}{cfg.get('prefix', '!stoat')}{RESET}", "")
+        else:
+            print()
+            print_colored(f"    [1] Install discord.py", "")
+        print_colored("    [0] Back", DIM)
+
+        choice = input("\n  Select: ").strip()
+
+        if choice == "0" or not choice:
+            return
+
+        elif choice == "1":
+            if discord_installed:
+                token = input("  Paste bot token (Enter to clear): ").strip()
+                cfg["token"] = token
+                save_discord_settings(cfg)
+                print_colored("  Token saved.", GREEN)
+            else:
+                confirm = input("  Install discord.py via pip? [y/n]: ").strip().lower()
+                if confirm == "y":
+                    if install_package("discord.py"):
+                        print_colored("  Restart Stoat to use Discord features.", YELLOW)
+
+        elif choice == "2" and discord_installed:
+            print_colored("  Trigger modes:", DIM)
+            print_colored("    all     — respond to every message in the channel", DIM)
+            print_colored("    mention — only when @Stoat is mentioned", DIM)
+            print_colored("    prefix  — only when message starts with prefix", DIM)
+            mode = input("  Enter mode [all/mention/prefix]: ").strip().lower()
+            if mode in ("all", "mention", "prefix"):
+                cfg["trigger"] = mode
+                save_discord_settings(cfg)
+                print_colored(f"  Trigger set to: {mode}", GREEN)
+            else:
+                print_colored("  Invalid mode.", RED)
+
+        elif choice == "3" and discord_installed and cfg.get("trigger") == "prefix":
+            prefix = input(f"  Prefix (current: {cfg.get('prefix', '!stoat')}): ").strip()
+            if prefix:
+                cfg["prefix"] = prefix
+                save_discord_settings(cfg)
+                print_colored(f"  Prefix set to: {prefix}", GREEN)
 
         else:
             print_colored("  Invalid selection", RED)
@@ -922,13 +1203,18 @@ def main():
                     continue
 
             try:
-                conversational_turn(user_input)
+                with _turn_lock:
+                    conversational_turn(user_input)
             except KeyboardInterrupt:
                 # Ctrl+C during generation — abort this turn, stay in REPL
                 print(f"\n{YELLOW}  (Interrupted){RESET}")
             draw_status_bar()
 
     finally:
+        if discord_bridge.is_running():
+            print_colored("\n  Stopping Discord bot...", DIM)
+            discord_bridge.stop_worker()
+            discord_bridge.stop()
         print_colored("\n  Stopping server...", DIM)
         stop_server()
         if readline:

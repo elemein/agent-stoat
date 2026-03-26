@@ -10,6 +10,8 @@ import fnmatch
 import os
 import re
 import subprocess
+import sys
+import threading
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -185,7 +187,7 @@ def read_file(path: str, start_line: int = None, end_line: int = None) -> str:
         content = "".join(lines)
 
         if len(content) > 5000:
-            shown_lines = lo + content[:5000].count("\n") + 1
+            shown_lines = lo + content[:5000].count("\n")
             content = content[:5000] + (
                 f"\n\n[Truncated — showing lines {lo + 1}–{shown_lines} of {total_lines}. "
                 f"Call read_file with start_line={shown_lines + 1} to continue.]"
@@ -337,12 +339,14 @@ def shell(command: str) -> str:
             "draw with canvas, generate programmatic output, or skip visual testing."
         )
     try:
+        _win_flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
+            **_win_flags
         )
         output = ""
         if result.stdout:
@@ -603,6 +607,7 @@ ALL_TOOL_NAMES: set[str] = set()
 # None = ask each time, True = always allow, False = always deny
 # Dangerous tools default to None (ask); safe tools default to True (allowed).
 _tool_permissions: dict[str, bool | None] = {}
+_permissions_lock = threading.Lock()  # protects _tool_permissions across threads
 
 
 def _init_permissions() -> None:
@@ -619,18 +624,21 @@ def is_dangerous(name: str) -> bool:
 
 def get_permission(name: str) -> bool | None:
     """Get the current permission setting for a tool."""
-    return _tool_permissions.get(name)
+    with _permissions_lock:
+        return _tool_permissions.get(name)
 
 
 def set_permission(name: str, value: bool | None) -> None:
     """Set a tool's permission (True=allow, False=deny, None=ask)."""
-    if name in _tool_permissions:
-        _tool_permissions[name] = value
+    with _permissions_lock:
+        if name in _tool_permissions:
+            _tool_permissions[name] = value
 
 
 def get_all_permissions() -> dict[str, bool | None]:
     """Return a copy of all tool permissions."""
-    return dict(_tool_permissions)
+    with _permissions_lock:
+        return dict(_tool_permissions)
 
 
 # Map tool names to functions

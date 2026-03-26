@@ -7,7 +7,9 @@ so the project has zero pip dependencies.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import socket
 import sys
@@ -133,6 +135,19 @@ class TokenUsage:
 token_usage = TokenUsage()
 
 
+def load_image_b64(path: str) -> tuple[str, str]:
+    """Load an image file and return (mime_type, base64_data).
+
+    Raises FileNotFoundError if the path doesn't exist.
+    """
+    mime, _ = mimetypes.guess_type(path)
+    if not mime or not mime.startswith("image/"):
+        mime = "image/jpeg"
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode("utf-8")
+    return mime, data
+
+
 def _get_api_url() -> str:
     """Get the llama-server API base URL (re-reads in case port changed)."""
     from llm_server import SERVER_HOST
@@ -253,6 +268,7 @@ def chat_stream(
     timeout: int = 300,
     print_output: bool = True,
     color: str = "\033[36m",
+    output_callback: "Callable[[str], None] | None" = None,
 ) -> dict:
     """Send a streaming chat request to llama-server (OpenAI-compatible API).
 
@@ -288,7 +304,8 @@ def chat_stream(
 
     # Thinking spinner — shows animated indicator until first token arrives
     _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    _spinner_active = [True]  # list for thread-safe mutation
+    _spinner_active = [True]   # mutable flag shared with spinner thread
+    _spinner_thread = [None]   # holds Thread reference so _stop_spinner can join it
     _spinner_start = [time.time()]
 
     def _thinking_spinner():
@@ -305,7 +322,9 @@ def chat_stream(
         """Stop the thinking spinner and clear its line."""
         if _spinner_active[0]:
             _spinner_active[0] = False
-            time.sleep(0.1)  # Let spinner thread finish its write
+            t = _spinner_thread[0]
+            if t is not None and t.is_alive():
+                t.join(timeout=0.5)  # wait for spinner to finish its current write
             sys.stdout.write("\r\033[2K")
             sys.stdout.flush()
 
@@ -320,6 +339,7 @@ def chat_stream(
         if print_output:
             _spinner_start[0] = time.time()
             spinner_thread = threading.Thread(target=_thinking_spinner, daemon=True)
+            _spinner_thread[0] = spinner_thread
             spinner_thread.start()
 
         with KeyboardMonitor() as kb:
@@ -385,6 +405,8 @@ def chat_stream(
                                     if print_output:
                                         sys.stdout.write(color + after)
                                         sys.stdout.flush()
+                                    if output_callback:
+                                        output_callback(after)
                                     full_content += after
                         elif not _THINK_OPEN.startswith(_think_buffer.lstrip()):
                             # Buffer can't become <think> — flush as real content
@@ -394,6 +416,8 @@ def chat_stream(
                             if print_output:
                                 sys.stdout.write(color + _think_buffer)
                                 sys.stdout.flush()
+                            if output_callback:
+                                output_callback(_think_buffer)
                             full_content += _think_buffer
                             _think_buffer = ""
 
@@ -410,6 +434,8 @@ def chat_stream(
                                 if print_output:
                                     sys.stdout.write(color + after)
                                     sys.stdout.flush()
+                                if output_callback:
+                                    output_callback(after)
                                 full_content += after
 
                     else:  # "streaming" — normal output
@@ -422,6 +448,8 @@ def chat_stream(
                         if print_output:
                             sys.stdout.write(content)
                             sys.stdout.flush()
+                        if output_callback:
+                            output_callback(content)
                         full_content += content
 
                 # Tool calls (streamed incrementally)

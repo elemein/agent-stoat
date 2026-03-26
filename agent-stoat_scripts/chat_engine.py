@@ -93,6 +93,7 @@ class ChatEngine:
         get_permission: Callable,
         conv_history: list,
         get_usage_pct: Callable = None,
+        ask_permission: Callable = None,
     ):
         self.llm_caller = llm_caller
         self.tool_executor = tool_executor
@@ -100,6 +101,10 @@ class ChatEngine:
         self.get_permission = get_permission
         self.conv_history = conv_history
         self.get_usage_pct = get_usage_pct
+        # Optional override for the interactive "allow this tool?" prompt.
+        # Signature: ask_permission(tool_name: str, args: dict) -> bool
+        # Defaults to a plain input() prompt if None.
+        self.ask_permission = ask_permission
 
     def run(
         self,
@@ -110,6 +115,7 @@ class ChatEngine:
         compaction: bool = False,
         compact_threshold: int = 80,
         keep_recent: int = 16,
+        output_callback: Callable = None,
     ) -> None:
         """Run the chat loop for one user message.
 
@@ -121,6 +127,7 @@ class ChatEngine:
             compact_threshold: Context usage percentage (0-100) at which compaction
                 triggers. Only used if compaction=True and get_usage_pct is set.
         """
+        keep_recent = max(1, keep_recent)  # guard against zero/negative
         # Inject working directory listing into system prompt
         messages = [{"role": "system", "content": prompt + self._dir_info()}]
 
@@ -137,7 +144,10 @@ class ChatEngine:
             if compaction:
                 messages = self._compact_messages(messages, keep_recent, compact_threshold)
 
-            response = self.llm_caller(messages, tools=tools, print_output=True, color=GREEN)
+            response = self.llm_caller(
+                messages, tools=tools, print_output=True, color=GREEN,
+                output_callback=output_callback,
+            )
 
             if response.get("interrupted"):
                 self._save_history(messages)
@@ -179,11 +189,15 @@ class ChatEngine:
                     messages.append({"role": "tool", "content": "(Blocked by policy)"})
                     continue
                 elif perm is None and self.is_dangerous(name):
-                    try:
-                        answer = input(f"  Allow {name}? [y/n]: ").strip().lower()
-                    except EOFError:
-                        answer = 'n'
-                    if answer != 'y':
+                    if self.ask_permission is not None:
+                        allowed = self.ask_permission(name, args)
+                    else:
+                        try:
+                            answer = input(f"  Allow {name}? [y/n]: ").strip().lower()
+                        except EOFError:
+                            answer = 'n'
+                        allowed = (answer == 'y')
+                    if not allowed:
                         _print("  -- (Denied)", RED)
                         messages.append({"role": "tool", "content": "(Denied by user)"})
                         continue
@@ -244,7 +258,7 @@ class ChatEngine:
         if compactable == 0:
             return messages
 
-        _print(f"\n  [Compaction] Context at {self.get_usage_pct():.0f}% — "
+        _print(f"\n  [Compaction] Context at {min(self.get_usage_pct(), 100):.0f}% — "
                f"summarizing {compactable} older messages "
                f"(keeping last {keep_recent} verbatim)", DIM)
 
