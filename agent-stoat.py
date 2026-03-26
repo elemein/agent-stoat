@@ -38,6 +38,8 @@ from integrations import (
     get_discord_settings, save_discord_settings,
 )
 import discord_bridge
+import persistent_mode
+import schedule_runner
 
 
 # ANSI colors
@@ -120,6 +122,21 @@ _discord_histories: dict[str, list[dict]] = {}
 
 # Prevents simultaneous CLI and Discord turns hitting the LLM at once
 _turn_lock = threading.Lock()
+
+
+def _heartbeat_alert(text: str) -> None:
+    """Called by the heartbeat/schedule thread when the model surfaces something."""
+    print(f"\n{YELLOW}{BOLD}[Stoat]{RESET} {text}")
+    if discord_bridge.is_running():
+        cfg = get_discord_settings()
+        alert_channel_id = cfg.get("alert_channel_id")
+        if alert_channel_id:
+            # Configured fixed channel (e.g. a server alert channel)
+            discord_bridge.send_to_channel(int(alert_channel_id), text)
+        else:
+            # Fall back to whichever channel most recently talked to Stoat
+            discord_bridge.send_to_last_active(text)
+    draw_status_bar()
 
 
 def _get_discord_history(guild_key: str) -> list[dict]:
@@ -252,11 +269,15 @@ def conversational_turn(user_input: str, discord_msg=None, conv_history=None) ->
 
         def _send_discord_reply(error: str = None):
             if error:
-                discord_msg.reply(f"_(error: {error})_")
+                msg = f"_(error: {error})_"
+                print(f"\n{RED}  [→ Discord] {msg}{RESET}", flush=True)
+                discord_msg.reply(msg)
                 return
             full = "".join(_response_buf).strip()
-            if full:
-                discord_msg.reply(full)
+            if not full:
+                full = "_(done)_"
+                print(f"\n{GREEN}  [→ Discord] {full}{RESET}", flush=True)
+            discord_msg.reply(full)
 
         try:
             run_chat(user_input, output_callback=output_callback, ask_permission=_ask_discord, conv_history=conv_history)
@@ -267,6 +288,21 @@ def conversational_turn(user_input: str, discord_msg=None, conv_history=None) ->
         return
 
     run_chat(user_input, conv_history=conv_history)
+
+
+def _check_clear_context_flag() -> bool:
+    """Check for the 4 AM context-clear flag. If set, wipe all conversation histories and delete it."""
+    flag_path = os.path.join(AGENT_DATA_DIR, "CLEAR_CONTEXT")
+    if not os.path.exists(flag_path):
+        return False
+    try:
+        os.remove(flag_path)
+    except Exception:
+        pass
+    _conv_history.clear()
+    _discord_histories.clear()
+    print_colored("  [Context cleared — daily reset]", DIM)
+    return True
 
 
 def _process_discord_message(discord_msg) -> None:
@@ -280,9 +316,19 @@ def _process_discord_message(discord_msg) -> None:
         guild_key = str(discord_msg.guild_id) if discord_msg.guild_id else f"dm_{discord_msg.user_id}"
         guild_history = _get_discord_history(guild_key)
 
-        # Prefix message with server label so the model knows which server it's in
-        labeled_content = f"[Server: {discord_msg.guild_name}] {discord_msg.content}"
+        # Prefix with full Discord context so the model knows who is asking and where,
+        # and can embed channel/mention in scheduled tasks for reliable delivery.
+        from datetime import datetime as _dt
+        _now = _dt.now().strftime("%Y-%m-%d %H:%M")
+        labeled_content = (
+            f"[Discord channel_id:{discord_msg.channel_id} "
+            f"server:{discord_msg.guild_name} "
+            f"user:{discord_msg.author} mention:{discord_msg.user_mention} "
+            f"time:{_now}] "
+            f"{discord_msg.content}"
+        )
 
+        _check_clear_context_flag()
         # Print clearly to terminal so the operator sees who asked what
         print(f"\n{CYAN}{BOLD}[Discord: {discord_msg.author} @ {discord_msg.guild_name}]{RESET} {discord_msg.content}")
         discord_bridge.clear_interrupt()
@@ -383,6 +429,9 @@ def handle_command(cmd: str) -> bool | None:
         print_colored("    /backend <name>  Switch GPU backend (cuda, vulkan, cpu)", DIM)
         print_colored("    /compact [n]     Compact history (keep last n messages, default 6)", DIM)
         print_colored("    /clear           Clear conversation history", DIM)
+        print_colored("    /baseprompt      Show current system prompt + heartbeat + memory", DIM)
+        print_colored("    /heartbeat <start|stop|now|status>  Control heartbeat / persistent mode", DIM)
+        print_colored("    /schedule <start|stop|now|status|show>  Control task scheduler", DIM)
         print_colored("    /discord <start|stop|status>  Control Discord bot", DIM)
         print_colored("    /exit, exit      Quit", DIM)
         print_colored("\n  Esc                Interrupt current generation", DIM)
@@ -673,6 +722,145 @@ def handle_command(cmd: str) -> bool | None:
             print_colored(f"  Place the {arg} build in: llama_cpp_backends/{arg}/", DIM)
         return True
 
+    elif command == '/baseprompt':
+        # Reconstruct the system prompt exactly as it gets sent to the model
+        settings = get_settings()
+        try:
+            preset = load_preset(settings.preset)
+        except FileNotFoundError:
+            preset = {}
+        prompt_file = preset.get("prompt_file", "prompt_basic.md")
+        try:
+            prompt = _load_prompt(prompt_file)
+        except FileNotFoundError:
+            prompt = BASIC_PROMPT
+
+        # Working dir suffix (same as ChatEngine._dir_info)
+        cwd = os.getcwd()
+        try:
+            entries = sorted(os.listdir(cwd))[:30]
+            dir_info = f"\n\nCurrent working directory: `{cwd}`\nFiles here: {', '.join(entries)}" if entries else f"\n\nCurrent working directory: `{cwd}` (empty)"
+        except Exception:
+            dir_info = f"\n\nCurrent working directory: `{cwd}`"
+
+        # Heartbeat + memory injections (shown if files exist)
+        hb_content = persistent_mode._read_file_safe(persistent_mode.get_heartbeat_path(AGENT_DATA_DIR))
+        mem_content = persistent_mode._read_file_safe(persistent_mode.get_memory_path(AGENT_DATA_DIR))
+
+        sep = "─" * 60
+        print(f"\n{BOLD}System Prompt  ({prompt_file}){RESET}")
+        print(DIM + sep + RESET)
+        print(prompt + dir_info)
+        if hb_content:
+            print(f"\n{BOLD}HEARTBEAT.md{RESET}")
+            print(DIM + sep + RESET)
+            print(hb_content)
+        if mem_content:
+            print(f"\n{BOLD}MEMORY.md{RESET}")
+            print(DIM + sep + RESET)
+            print(mem_content)
+        print(DIM + sep + RESET)
+        total_chars = len(prompt) + len(dir_info) + len(hb_content) + len(mem_content)
+        print_colored(f"  ~{total_chars // 4} tokens estimated", DIM)
+        return True
+
+    elif command == '/heartbeat':
+        sub = (arg or "").strip().lower()
+        if sub == "start":
+            if persistent_mode.is_running():
+                print_colored("  Heartbeat is already running.", CYAN)
+            else:
+                persistent_mode.start(
+                    data_dir=AGENT_DATA_DIR,
+                    llm_caller=chat_stream,
+                    tool_executor=execute_tool,
+                    turn_lock=_turn_lock,
+                    alert_callback=_heartbeat_alert,
+                    tools=TOOLS,
+                )
+                print_colored("  Heartbeat started (every 30 min).", GREEN)
+        elif sub == "stop":
+            if persistent_mode.is_running():
+                persistent_mode.stop()
+                print_colored("  Heartbeat stopped.", YELLOW)
+            else:
+                print_colored("  Heartbeat is not running.", DIM)
+        elif sub == "now":
+            print_colored("  Triggering heartbeat tick...", DIM)
+            persistent_mode.trigger_now(
+                data_dir=AGENT_DATA_DIR,
+                llm_caller=chat_stream,
+                tool_executor=execute_tool,
+                turn_lock=_turn_lock,
+                alert_callback=_heartbeat_alert,
+                tools=TOOLS,
+            )
+        elif sub == "status":
+            running = persistent_mode.is_running()
+            print_colored(f"\n  Heartbeat: {'running' if running else 'stopped'}", GREEN if running else DIM)
+            hb_path = persistent_mode.get_heartbeat_path(AGENT_DATA_DIR)
+            mem_path = persistent_mode.get_memory_path(AGENT_DATA_DIR)
+            print_colored(f"  Checklist: {hb_path}", CYAN)
+            print_colored(f"  Memory:    {mem_path}", CYAN)
+        else:
+            print_colored("  Usage: /heartbeat <start|stop|now|status>", DIM)
+        return True
+
+    elif command == '/schedule':
+        sub = (arg or "").strip().lower()
+        sched_path = schedule_runner.get_schedule_path(AGENT_DATA_DIR)
+        if sub == "start":
+            if schedule_runner.is_running():
+                print_colored("  Scheduler is already running.", CYAN)
+            else:
+                try:
+                    schedule_runner.start(
+                        data_dir=AGENT_DATA_DIR,
+                        llm_caller=chat_stream,
+                        tool_executor=execute_tool,
+                        turn_lock=_turn_lock,
+                        alert_callback=_heartbeat_alert,
+                        tools=TOOLS,
+                    )
+                    print_colored("  Scheduler started (polls every 2 min).", GREEN)
+                except Exception as e:
+                    print_colored(f"  Failed to start scheduler: {e}", RED)
+        elif sub == "stop":
+            if schedule_runner.is_running():
+                schedule_runner.stop()
+                print_colored("  Scheduler stopped.", YELLOW)
+            else:
+                print_colored("  Scheduler is not running.", DIM)
+        elif sub == "now":
+            print_colored("  Running schedule poll...", DIM)
+            try:
+                schedule_runner.trigger_now(
+                    data_dir=AGENT_DATA_DIR,
+                    llm_caller=chat_stream,
+                    tool_executor=execute_tool,
+                    turn_lock=_turn_lock,
+                    alert_callback=_heartbeat_alert,
+                    tools=TOOLS,
+                )
+                print_colored("  Done.", GREEN)
+            except Exception as e:
+                print_colored(f"  Schedule poll failed: {e}", RED)
+        elif sub == "status":
+            running = schedule_runner.is_running()
+            print_colored(f"\n  Scheduler: {'running' if running else 'stopped'}", GREEN if running else DIM)
+            print_colored(f"  Schedule file: {sched_path}", CYAN)
+        elif sub in ("show", "list", ""):
+            schedule_runner.ensure_default_schedule(AGENT_DATA_DIR)
+            try:
+                with open(sched_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                print(content)
+            except Exception as e:
+                print_colored(f"  Could not read SCHEDULE.md: {e}", RED)
+        else:
+            print_colored("  Usage: /schedule <start|stop|now|status|show>", DIM)
+        return True
+
     elif command == '/discord':
         sub = (arg or "").strip().lower()
         if sub == "start":
@@ -681,6 +869,7 @@ def handle_command(cmd: str) -> bool | None:
             else:
                 cfg = get_discord_settings()
                 if discord_bridge.start(cfg):
+                    schedule_runner.set_discord_send_fn(discord_bridge.send_to_channel)
                     print_colored("  Discord bot started.", GREEN)
                 else:
                     print_colored("  Failed to start Discord bot. Check token and install status.", RED)
@@ -728,11 +917,10 @@ def startup_menu() -> None:
         discord_installed = is_installed("discord")
         discord_cfg = get_discord_settings()
         discord_ready = discord_installed and bool(discord_cfg.get("token"))
-        discord_tag = (GREEN + "ready" + RESET) if discord_ready else (DIM + "not configured" + RESET)
 
         rows = [
             ("[1] Start", None, ""),
-            ("[2] Start  (Persistent + Discord)", None, ""),
+            ("[2] Start  (Persistent + Integrations)", None, ""),
             ("[3] Load Model       ", model_tag, model_color),
             ("[4] Set Context Window", None, ""),
             ("[5] Set Permissions", None, ""),
@@ -769,6 +957,8 @@ def startup_menu() -> None:
             if not server_up:
                 print_colored("  No model loaded! Use [3] to load one first.", YELLOW)
                 continue
+            session_dir = _select_working_dir()
+            os.chdir(session_dir)
             return
 
         elif choice == '2':
@@ -781,12 +971,36 @@ def startup_menu() -> None:
             if not discord_cfg.get("token"):
                 print_colored("  No bot token set. Go to [8] Integrations → Discord to configure it.", YELLOW)
                 continue
+            # Switch to persistent preset so the prompt includes heartbeat/scheduler/Discord context
+            if not settings.preset.startswith("persistent"):
+                settings.preset = "persistent_compacted"
+            persistent_mode.start(
+                data_dir=AGENT_DATA_DIR,
+                llm_caller=chat_stream,
+                tool_executor=execute_tool,
+                turn_lock=_turn_lock,
+                alert_callback=_heartbeat_alert,
+                tools=TOOLS,
+            )
+            schedule_runner.start(
+                data_dir=AGENT_DATA_DIR,
+                llm_caller=chat_stream,
+                tool_executor=execute_tool,
+                turn_lock=_turn_lock,
+                alert_callback=_heartbeat_alert,
+                tools=TOOLS,
+            )
             if discord_bridge.start(discord_cfg):
                 discord_bridge.start_worker(_process_discord_message)
-                print_colored("  Discord bot started. Running in Persistent + Discord mode.", GREEN)
+                schedule_runner.set_discord_send_fn(discord_bridge.send_to_channel)
+                print_colored("  Persistent + Integrations started.", GREEN)
             else:
                 print_colored("  Failed to start Discord bot. Check your token in Integrations.", RED)
+                persistent_mode.stop()
+                schedule_runner.stop()
                 continue
+            session_dir = _select_working_dir()
+            os.chdir(session_dir)
             return
 
         elif choice == '3':
@@ -1160,9 +1374,6 @@ def main():
         print_colored("    See setup instructions above.", RED)
         return
 
-    session_dir = _select_working_dir()
-    os.chdir(session_dir)
-
     print_header()
     startup_menu()
 
@@ -1204,6 +1415,7 @@ def main():
 
             try:
                 with _turn_lock:
+                    _check_clear_context_flag()
                     conversational_turn(user_input)
             except KeyboardInterrupt:
                 # Ctrl+C during generation — abort this turn, stay in REPL
@@ -1211,6 +1423,12 @@ def main():
             draw_status_bar()
 
     finally:
+        if schedule_runner.is_running():
+            print_colored("\n  Stopping scheduler...", DIM)
+            schedule_runner.stop()
+        if persistent_mode.is_running():
+            print_colored("\n  Stopping heartbeat...", DIM)
+            persistent_mode.stop()
         if discord_bridge.is_running():
             print_colored("\n  Stopping Discord bot...", DIM)
             discord_bridge.stop_worker()

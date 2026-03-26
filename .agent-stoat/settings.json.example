@@ -1,0 +1,12 @@
+{
+  "model": "your-model-filename.gguf",
+  "temperature": 0.7,
+  "num_ctx": 32768,
+  "discord": {
+    "token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+    "trigger": "mention",
+    "prefix": "!stoat",
+    "alert_channel_id": null,
+    "enabled_on_startup": false
+  }
+}

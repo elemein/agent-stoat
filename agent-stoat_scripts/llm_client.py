@@ -628,7 +628,9 @@ def estimate_recommended_ctx(model_info: dict, vram_info: dict, model_loaded: bo
     if model_loaded:
         free_for_kv_mb = vram_info["free_mb"] - OVERHEAD_MB
     else:
-        free_for_kv_mb = vram_info["free_mb"] - model_vram_mb - OVERHEAD_MB
+        # Model isn't loaded yet — base KV budget on total VRAM, not current free
+        # (free may be low due to OS/other apps that will yield once the model loads)
+        free_for_kv_mb = vram_info["total_mb"] - model_vram_mb - OVERHEAD_MB
 
     if free_for_kv_mb <= 0:
         return {

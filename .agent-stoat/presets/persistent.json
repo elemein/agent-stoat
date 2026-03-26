@@ -1,0 +1,9 @@
+{
+  "name": "Persistent",
+  "description": "Full persistent mode — heartbeat, scheduler, Discord context. No compaction.",
+  "prompt_file": "prompt_persistent.md",
+  "max_iterations": 50,
+  "compaction": {
+    "enabled": false
+  }
+}

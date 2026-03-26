@@ -58,6 +58,10 @@ _running = False
 _worker_thread: threading.Thread | None = None
 _worker_stop = threading.Event()
 
+# Most recently active Discord channel object — used as fallback for alerts.
+# Storing the object (not just the ID) means DM channels work without a fetch.
+_last_active_channel = None
+
 
 def get_message_queue() -> queue.Queue[DiscordMessage]:
     return _message_queue
@@ -236,6 +240,8 @@ def _make_client(cfg: dict):
             guild_name=message.guild.name if message.guild else "DM",
             reply_fn=sync_reply,
         )
+        global _last_active_channel
+        _last_active_channel = message.channel
         _message_queue.put(dm)
 
         # Show typing while the main thread processes, then send reply.
@@ -381,3 +387,17 @@ def send_to_channel(channel_id: int, text: str) -> None:
             await channel.send(part)
 
     asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
+
+
+def send_to_last_active(text: str) -> bool:
+    """Send text to the most recently active Discord channel. Returns True if attempted."""
+    if not _running or _bot_client is None or _bot_loop is None or _last_active_channel is None:
+        return False
+    channel = _last_active_channel
+
+    async def _send():
+        for part in [text[i:i + 1900] for i in range(0, len(text), 1900)]:
+            await channel.send(part)
+
+    asyncio.run_coroutine_threadsafe(_send(), _bot_loop)
+    return True

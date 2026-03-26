@@ -21,7 +21,14 @@ MAX_ITERATIONS = 50   # Max tool-calling rounds per user message
 
 # ── Platform info (injected into prompts via {platform}/{shell}) ──────────
 _PLATFORM = platform.system()
-_SHELL_INFO = "PowerShell/cmd on Windows" if _PLATFORM == "Windows" else "bash on Linux"
+def _detect_shell() -> str:
+    if _PLATFORM != "Windows":
+        return os.environ.get("SHELL", "bash")
+    if "PSModulePath" in os.environ:
+        return "PowerShell"
+    return "cmd.exe"
+
+_SHELL_INFO = _detect_shell()
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 

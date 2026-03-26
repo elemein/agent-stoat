@@ -1,0 +1,11 @@
+{
+  "name": "Persistent (w/ Compaction)",
+  "description": "Full persistent mode — heartbeat, scheduler, Discord context. Auto-compacts when context fills past threshold.",
+  "prompt_file": "prompt_persistent.md",
+  "max_iterations": 50,
+  "compaction": {
+    "enabled": true,
+    "threshold": 80,
+    "keep_recent": 16
+  }
+}

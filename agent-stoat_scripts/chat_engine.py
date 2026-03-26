@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Callable
 
 from tool_parser import extract_tool_calls, get_response_content
@@ -212,17 +213,84 @@ class ChatEngine:
 
     # ── Private helpers ───────────────────────────────────────────────────
 
+    def _memory_check(self, old_messages: list[dict]) -> None:
+        """Before compaction, silently ask the model if anything is worth saving to memory."""
+        _MEMORY_TOOLS = {"update_memory", "append_daily_log"}
+
+        # Build a readable summary of the old messages
+        lines = []
+        for m in old_messages:
+            role = m.get("role", "")
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+            content = str(content)[:300].replace("\n", " ").strip()
+            if role == "user" and content:
+                lines.append(f"User: {content}")
+            elif role == "assistant" and content:
+                lines.append(f"Stoat: {content}")
+        if not lines:
+            return
+
+        prompt = (
+            "You are reviewing a conversation about to be compacted out of context. "
+            "Is anything here genuinely worth saving to long-term memory or the daily log? "
+            "Be very selective — only save things that would actually be useful later: "
+            "facts about the user, important decisions, ongoing tasks, preferences. "
+            "If nothing is worth saving, respond only with: SKIP"
+        )
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": "\n".join(lines)},
+        ]
+
+        # Only allow memory tools during this check
+        from tools import TOOLS as _ALL_TOOLS  # type: ignore
+        memory_tools = [t for t in _ALL_TOOLS if t.get("function", {}).get("name") in _MEMORY_TOOLS]
+
+        try:
+            response = self.llm_caller(messages, tools=memory_tools or None, print_output=False, output_callback=None)
+        except Exception:
+            return
+
+        content = (response.get("message") or {}).get("content") or ""
+        tool_calls = (response.get("message") or {}).get("tool_calls") or []
+
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name", "")
+            args = tc.get("function", {}).get("arguments", {})
+            if name in _MEMORY_TOOLS and self.tool_executor:
+                try:
+                    result = self.tool_executor(name, args)
+                    _print(f"  [Compaction] Memory saved: {result[:60]}", DIM)
+                except Exception:
+                    pass
+
     @staticmethod
     def _dir_info() -> str:
-        """Build a working directory summary to append to the system prompt."""
+        """Build a time + working directory summary to append to the system prompt."""
+        now = datetime.now().strftime("%A, %Y-%m-%d %H:%M")
         cwd = os.getcwd()
         try:
             entries = sorted(os.listdir(cwd))[:30]
             if entries:
-                return f"\n\nCurrent working directory: `{cwd}`\nFiles here: {', '.join(entries)}"
-            return f"\n\nCurrent working directory: `{cwd}` (empty)"
+                info = f"\n\nCurrent time: {now}\nCurrent working directory: `{cwd}`\nFiles here: {', '.join(entries)}"
+            else:
+                info = f"\n\nCurrent time: {now}\nCurrent working directory: `{cwd}` (empty)"
         except Exception:
-            return f"\n\nCurrent working directory: `{cwd}`"
+            info = f"\n\nCurrent time: {now}\nCurrent working directory: `{cwd}`"
+
+        # Append SOUL.md if present (character/personality layer)
+        soul_path = os.path.join(os.path.dirname(__file__), "..", ".agent-stoat", "SOUL.md")
+        try:
+            with open(os.path.normpath(soul_path), "r", encoding="utf-8") as f:
+                soul = f.read().strip()
+            if soul:
+                info += f"\n\n{soul}"
+        except FileNotFoundError:
+            pass
+
+        return info
 
     def _save_history(self, messages: list[dict]) -> None:
         """Sync messages back to the shared conv_history (excluding system prompt)."""
@@ -257,6 +325,9 @@ class ChatEngine:
         compactable = sum(1 for m in old if m.get("role") in ("assistant", "tool"))
         if compactable == 0:
             return messages
+
+        # Before compacting, give the model a chance to save anything worth keeping
+        self._memory_check(old)
 
         _print(f"\n  [Compaction] Context at {min(self.get_usage_pct(), 100):.0f}% — "
                f"summarizing {compactable} older messages "

@@ -161,6 +161,109 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_schedule",
+            "description": "Read Stoat's schedule file (SCHEDULE.md). Use this to see what tasks are currently scheduled.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_schedule",
+            "description": (
+                "Overwrite Stoat's schedule file (SCHEDULE.md) with new content. "
+                "Valid formats per line:\n"
+                "  YYYY-MM-DD HH:MM | task          (one-time)\n"
+                "  daily HH:MM | task               (repeats daily)\n"
+                "  every Xh | task                  (repeats every X hours)\n"
+                "  every Xm | task                  (repeats every X minutes)\n"
+                "To deliver a message directly to the user, prefix the task with 'message:'\n"
+                "Always include [ch:CHANNEL_ID] to route to the right Discord channel, and @mention the requesting user in the message.\n"
+                "  Example: 2026-03-26 14:00 | message: <@123456789> Hey! Your build finished. [ch:987654321]\n"
+                "The channel_id and user mention are in the [Discord channel_id:NNNN ... mention:<@ID>] prefix of incoming messages.\n"
+                "Without 'message:', the task runs as an LLM reasoning tick.\n"
+                "Do not include or modify [next: ...] or [done: ...] annotations — those are managed automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Full new content for SCHEDULE.md"}
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Return the current local date and time. Use this whenever you need to know the current time — no shell or permissions required.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_memory",
+            "description": "Read Stoat's persistent memory file (MEMORY.md). Use this to recall notes, tasks, or context saved across sessions.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_memory",
+            "description": "Overwrite Stoat's persistent memory file (MEMORY.md) with new content. Keep it concise — under 100 lines. Use markdown headers to organise sections (## People, ## Facts, ## Ongoing, ## Notes).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Full new content for MEMORY.md"}
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_daily_log",
+            "description": "Read the current daily log — a running record of notable events since the last 4 AM reset.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_daily_log",
+            "description": "Append a timestamped entry to the daily log. Use during conversation to note anything worth remembering — facts learned, tasks completed, decisions made.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry": {"type": "string", "description": "The note to log (one line, plain text)"}
+                },
+                "required": ["entry"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_context",
+            "description": "Flag that conversation context should be cleared on the next user interaction. Used by the 4 AM daily reset to start fresh each day.",
+            "parameters": {"type": "object", "properties": {}, "required": []}
+        }
+    },
 ]
 
 
@@ -596,6 +699,136 @@ def search_files(pattern: str, path: str = ".", glob: str = None) -> str:
         return f"Error searching files: {e}"
 
 
+# --- Time tool ---
+
+def get_current_time() -> str:
+    """Return the current local date and time."""
+    from datetime import datetime
+    return datetime.now().strftime("%A, %Y-%m-%d %H:%M:%S")
+
+
+# --- Memory tools ---
+
+_MEMORY_MAX_LINES = 100
+
+
+def read_memory() -> str:
+    """Read the persistent MEMORY.md file."""
+    path = os.path.join(AGENT_DATA_DIR, "MEMORY.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "(MEMORY.md does not exist yet — use update_memory to create it)"
+    except Exception as e:
+        return f"Error reading memory: {e}"
+
+
+def update_memory(content: str) -> str:
+    """Overwrite MEMORY.md with new content (capped at _MEMORY_MAX_LINES lines)."""
+    if not content or not content.strip():
+        return "Error: content cannot be empty."
+    lines = content.splitlines()
+    if len(lines) > _MEMORY_MAX_LINES:
+        content = "\n".join(lines[:_MEMORY_MAX_LINES]) + f"\n\n[Truncated to {_MEMORY_MAX_LINES} lines]"
+    path = os.path.join(AGENT_DATA_DIR, "MEMORY.md")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Memory updated ({len(content)} chars)"
+    except Exception as e:
+        return f"Error writing memory: {e}"
+
+
+# --- Daily log tools ---
+
+_DAILY_LOG_PATH = os.path.join(AGENT_DATA_DIR, "DAILY_LOG.md")
+_daily_log_lock = threading.Lock()
+
+
+def read_daily_log() -> str:
+    """Read the current daily log (entries since the last 4 AM reset)."""
+    try:
+        with open(_DAILY_LOG_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+        return content if content.strip() else "(Daily log is empty)"
+    except FileNotFoundError:
+        return "(Daily log is empty)"
+    except Exception as e:
+        return f"Error reading daily log: {e}"
+
+
+def append_daily_log(entry: str) -> str:
+    """Append a timestamped entry to the daily log. Use this to note anything worth remembering from the current conversation."""
+    from datetime import datetime
+    if not entry or not entry.strip():
+        return "Error: entry cannot be empty."
+    ts = datetime.now().strftime("%H:%M")
+    line = f"[{ts}] {entry.strip()}\n"
+    try:
+        with _daily_log_lock:
+            with open(_DAILY_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+        return "Logged."
+    except Exception as e:
+        return f"Error writing daily log: {e}"
+
+
+def clear_context() -> str:
+    """Signal that conversation context should be cleared on the next user interaction. Used by the 4 AM daily reset."""
+    flag_path = os.path.join(AGENT_DATA_DIR, "CLEAR_CONTEXT")
+    try:
+        with open(flag_path, "w", encoding="utf-8") as f:
+            from datetime import datetime
+            f.write(datetime.now().isoformat())
+        return "Context clear flagged — will take effect on next interaction."
+    except Exception as e:
+        return f"Error writing clear flag: {e}"
+
+
+# --- Schedule tools ---
+
+_SCHEDULE_HEADER = (
+    "# Stoat Schedule\n"
+    "#\n"
+    "# Formats:\n"
+    "#   YYYY-MM-DD HH:MM  | task description     (one-time)\n"
+    "#   daily HH:MM       | task description     (repeats daily)\n"
+    "#   every Xh          | task description     (repeats every X hours)\n"
+    "#   every Xm          | task description     (repeats every X minutes)\n"
+    "#\n"
+    "# Do not hand-edit [next: ...] or [done: ...] annotations.\n"
+)
+
+
+def read_schedule() -> str:
+    """Read the persistent SCHEDULE.md file."""
+    path = os.path.join(AGENT_DATA_DIR, "SCHEDULE.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "(SCHEDULE.md is empty — use update_schedule to add tasks)"
+    except Exception as e:
+        return f"Error reading schedule: {e}"
+
+
+def update_schedule(content: str) -> str:
+    """Overwrite SCHEDULE.md with new content. Preserve the header comment block."""
+    if not content or not content.strip():
+        return "Error: content cannot be empty."
+    # Ensure header is present
+    if not content.lstrip().startswith("#"):
+        content = _SCHEDULE_HEADER + "\n" + content
+    path = os.path.join(AGENT_DATA_DIR, "SCHEDULE.md")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Schedule updated ({content.count(chr(10))+1} lines)"
+    except Exception as e:
+        return f"Error writing schedule: {e}"
+
+
 # --- Tool Permission System ---
 
 # Tools that default to "ask" (None) — potentially destructive operations
@@ -652,6 +885,14 @@ TOOL_FUNCTIONS = {
     "list_dir": list_dir,
     "find_files": find_files,
     "search_files": search_files,
+    "read_schedule": read_schedule,
+    "update_schedule": update_schedule,
+    "get_current_time": get_current_time,
+    "read_memory": read_memory,
+    "update_memory": update_memory,
+    "read_daily_log": read_daily_log,
+    "append_daily_log": append_daily_log,
+    "clear_context": clear_context,
 }
 
 

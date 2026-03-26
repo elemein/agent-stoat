@@ -7,9 +7,10 @@ __pycache__/
 llama_cpp_backends/cuda/*
 !llama_cpp_backends/cuda/.gitkeep
 
-# Agent runtime state — ignore specific runtime files, keep presets/ tracked
+# Agent runtime state — ignore user data and secrets, keep presets/ tracked
 .agent-stoat/history
 .agent-stoat/settings.json
+.agent-stoat/CLEAR_CONTEXT
 .agent-stoat/*.log
 .agent-stoat/*.md
 .agent-stoat/blackboard.json
