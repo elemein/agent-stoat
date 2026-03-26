@@ -16,6 +16,8 @@ python agent-stoat.py  →  Start (Interactive)
 ### 2. Persistent (+ Integrations)
 Stoat runs continuously alongside you. It maintains long-term memory across sessions, fires background checks on a schedule, and can receive and respond to messages via Discord.
 
+> Persistent mode is inspired by [OpenClaw](https://github.com/botanicastudios/openclaw), bringing that same always-on, memory-backed agent pattern to a fully local setup.
+
 ```
 python agent-stoat.py  →  Start (Persistent + Integrations)
 ```
